@@ -75,10 +75,12 @@ vi.mock("openai", () => {
   }
 
   class APIConnectionTimeoutError extends Error {}
+  class AzureOpenAI extends FakeOpenAI {}
 
   return {
     __esModule: true,
     default: FakeOpenAI,
+    AzureOpenAI,
     APIConnectionTimeoutError,
     // Re‑export so the test can access the captured body.
     _test: {
@@ -118,6 +120,7 @@ describe("function_call_output includes original call ID", () => {
       model: "any",
       instructions: "",
       approvalPolicy: { mode: "auto" } as any,
+      additionalWritableRoots: [],
       onItem: () => {},
       onLoading: () => {},
       getCommandConfirmation: async () => ({ review: "yes" } as any),

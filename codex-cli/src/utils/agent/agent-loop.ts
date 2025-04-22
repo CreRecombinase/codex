@@ -1,6 +1,6 @@
-import type { ReviewDecision } from "./review.js";
 import type { ApplyPatchCommand, ApprovalPolicy } from "../../approvals.js";
 import type { AppConfig } from "../config.js";
+import type { ReviewDecision } from "./review.js";
 import type {
   ResponseFunctionToolCall,
   ResponseInputItem,
@@ -8,8 +8,14 @@ import type {
 } from "openai/resources/responses/responses.mjs";
 import type { Reasoning } from "openai/resources.mjs";
 
-import { log, isLoggingEnabled } from "./log.js";
-import { OPENAI_BASE_URL, OPENAI_TIMEOUT_MS } from "../config.js";
+import {
+  AZURE_OPENAI_API_KEY,
+  AZURE_OPENAI_API_VERSION,
+  AZURE_OPENAI_DEPLOYMENT,
+  AZURE_OPENAI_ENDPOINT,
+  OPENAI_BASE_URL,
+  OPENAI_TIMEOUT_MS,
+} from "../config.js";
 import { parseToolCallArguments } from "../parsers.js";
 import {
   ORIGIN,
@@ -19,8 +25,10 @@ import {
   setSessionId,
 } from "../session.js";
 import { handleExecCommand } from "./handle-exec-command.js";
+import { log } from "./log.js";
+import { DefaultAzureCredential, getBearerTokenProvider } from "@azure/identity";
 import { randomUUID } from "node:crypto";
-import OpenAI, { APIConnectionTimeoutError } from "openai";
+import OpenAI, { APIConnectionTimeoutError, AzureOpenAI } from "openai";
 
 // Wait time before retrying after rate limit errors (ms).
 const RATE_LIMIT_RETRY_WAIT_MS = parseInt(
@@ -32,6 +40,7 @@ export type CommandConfirmation = {
   review: ReviewDecision;
   applyPatch?: ApplyPatchCommand | undefined;
   customDenyMessage?: string;
+  explanation?: string;
 };
 
 const alreadyProcessedResponses = new Set();
@@ -43,6 +52,9 @@ type AgentLoopParams = {
   approvalPolicy: ApprovalPolicy;
   onItem: (item: ResponseItem) => void;
   onLoading: (loading: boolean) => void;
+
+  /** Extra writable roots to use with sandbox execution. */
+  additionalWritableRoots: ReadonlyArray<string>;
 
   /** Called when the command is not auto-approved to request explicit user review. */
   getCommandConfirmation: (
@@ -57,6 +69,7 @@ export class AgentLoop {
   private instructions?: string;
   private approvalPolicy: ApprovalPolicy;
   private config: AppConfig;
+  private additionalWritableRoots: ReadonlyArray<string>;
 
   // Using `InstanceType<typeof OpenAI>` sidesteps typing issues with the OpenAI package under
   // the TS 5+ `moduleResolution=bundler` setup. OpenAI client instance. We keep the concrete
@@ -108,35 +121,28 @@ export class AgentLoop {
     if (this.terminated) {
       return;
     }
-    if (isLoggingEnabled()) {
-      log(
-        `AgentLoop.cancel() invoked – currentStream=${Boolean(
-          this.currentStream,
-        )} execAbortController=${Boolean(
-          this.execAbortController,
-        )} generation=${this.generation}`,
-      );
-    }
+
+    // Reset the current stream to allow new requests
+    this.currentStream = null;
+    log(
+      `AgentLoop.cancel() invoked – currentStream=${Boolean(
+        this.currentStream,
+      )} execAbortController=${Boolean(this.execAbortController)} generation=${
+        this.generation
+      }`,
+    );
     (
       this.currentStream as { controller?: { abort?: () => void } } | null
     )?.controller?.abort?.();
 
     this.canceled = true;
+
+    // Abort any in-progress tool calls
     this.execAbortController?.abort();
-    if (isLoggingEnabled()) {
-      log("AgentLoop.cancel(): execAbortController.abort() called");
-    }
 
-    // If we have *not* seen any function_call IDs yet there is nothing that
-    // needs to be satisfied in a follow‑up request.  In that case we clear
-    // the stored lastResponseId so a subsequent run starts a clean turn.
-    if (this.pendingAborts.size === 0) {
-      try {
-        this.onLastResponseId("");
-      } catch {
-        /* ignore */
-      }
-    }
+    // Create a new abort controller for future tool calls
+    this.execAbortController = new AbortController();
+    log("AgentLoop.cancel(): execAbortController.abort() called");
 
     // NOTE: We intentionally do *not* clear `lastResponseId` here.  If the
     // stream produced a `function_call` before the user cancelled, OpenAI now
@@ -155,11 +161,6 @@ export class AgentLoop {
       }
     }
 
-    // NOTE: We intentionally do *not* clear `lastResponseId` here.  If the
-    // stream produced a `function_call` before the user cancelled, OpenAI now
-    // expects a corresponding `function_call_output` that must reference that
-    // very same response ID.  We therefore keep the ID around so the
-    // follow‑up request can still satisfy the contract.
     this.onLoading(false);
 
     /* Inform the UI that the run was aborted by the user. */
@@ -177,9 +178,7 @@ export class AgentLoop {
     // this.onItem(cancelNotice);
 
     this.generation += 1;
-    if (isLoggingEnabled()) {
-      log(`AgentLoop.cancel(): generation bumped to ${this.generation}`);
-    }
+    log(`AgentLoop.cancel(): generation bumped to ${this.generation}`);
   }
 
   /**
@@ -220,6 +219,7 @@ export class AgentLoop {
     onLoading,
     getCommandConfirmation,
     onLastResponseId,
+    additionalWritableRoots,
   }: AgentLoopParams & { config?: AppConfig }) {
     this.model = model;
     this.instructions = instructions;
@@ -236,6 +236,7 @@ export class AgentLoop {
         model,
         instructions: instructions ?? "",
       } as AppConfig);
+    this.additionalWritableRoots = additionalWritableRoots;
     this.onItem = onItem;
     this.onLoading = onLoading;
     this.getCommandConfirmation = getCommandConfirmation;
@@ -244,22 +245,60 @@ export class AgentLoop {
     // Configure OpenAI client with optional timeout (ms) from environment
     const timeoutMs = OPENAI_TIMEOUT_MS;
     const apiKey = this.config.apiKey ?? process.env["OPENAI_API_KEY"] ?? "";
-    this.oai = new OpenAI({
-      // The OpenAI JS SDK only requires `apiKey` when making requests against
-      // the official API.  When running unit‑tests we stub out all network
-      // calls so an undefined key is perfectly fine.  We therefore only set
-      // the property if we actually have a value to avoid triggering runtime
-      // errors inside the SDK (it validates that `apiKey` is a non‑empty
-      // string when the field is present).
-      ...(apiKey ? { apiKey } : {}),
-      baseURL: OPENAI_BASE_URL,
-      defaultHeaders: {
-        originator: ORIGIN,
-        version: CLI_VERSION,
-        session_id: this.sessionId,
-      },
-      ...(timeoutMs !== undefined ? { timeout: timeoutMs } : {}),
-    });
+    const azureEndpoint = AZURE_OPENAI_ENDPOINT;
+
+    if (azureEndpoint) {
+      log("Using Azure OpenAI authentication path");
+      try {
+        // Try Entra ID (Azure AD) authentication first
+        try {
+          log("Attempting Azure OpenAI Entra ID authentication");
+          const credential = new DefaultAzureCredential();
+          const scope = "https://cognitiveservices.azure.com/.default";
+          const azureADTokenProvider = getBearerTokenProvider(credential, scope);
+
+          this.oai = new AzureOpenAI({
+            azureADTokenProvider,
+            apiVersion: AZURE_OPENAI_API_VERSION!,
+            deployment: AZURE_OPENAI_DEPLOYMENT!,
+            ...(timeoutMs !== undefined ? { timeout: timeoutMs } : {}),
+          });
+          log("Successfully created Azure OpenAI client with Entra ID authentication");
+        } catch (entraidError) {
+          // Fall back to API key if Entra ID fails
+          if (AZURE_OPENAI_API_KEY) {
+            log("Entra ID authentication failed, falling back to API key authentication");
+            this.oai = new AzureOpenAI({
+              apiKey: AZURE_OPENAI_API_KEY,
+              apiVersion: AZURE_OPENAI_API_VERSION!,
+              deployment: AZURE_OPENAI_DEPLOYMENT!,
+              ...(timeoutMs !== undefined ? { timeout: timeoutMs } : {}),
+            });
+            log("Successfully created Azure OpenAI client with API key authentication");
+          } else {
+            // If we have no API key to fall back to, rethrow the original error
+            log("No API key available as fallback");
+            throw entraidError;
+          }
+        }
+        log("Successfully created Azure OpenAI client in Agent Loop");
+      } catch (error) {
+        log(`Error creating Azure OpenAI client: ${error}`);
+        throw error;
+      }
+    } else {
+      log("Using standard OpenAI authentication path");
+      this.oai = new OpenAI({
+        ...(apiKey ? { apiKey } : {}),
+        baseURL: OPENAI_BASE_URL,
+        defaultHeaders: {
+          originator: ORIGIN,
+          version: CLI_VERSION,
+          session_id: this.sessionId,
+        },
+        ...(timeoutMs !== undefined ? { timeout: timeoutMs } : {}),
+      });
+    }
 
     setSessionId(this.sessionId);
     setCurrentModel(this.model);
@@ -316,13 +355,11 @@ export class AgentLoop {
     const callId: string = (item as any).call_id ?? (item as any).id;
 
     const args = parseToolCallArguments(rawArguments ?? "{}");
-    if (isLoggingEnabled()) {
-      log(
-        `handleFunctionCall(): name=${
-          name ?? "undefined"
-        } callId=${callId} args=${rawArguments}`,
-      );
-    }
+    log(
+      `handleFunctionCall(): name=${
+        name ?? "undefined"
+      } callId=${callId} args=${rawArguments}`,
+    );
 
     if (args == null) {
       const outputItem: ResponseInputItem.FunctionCallOutput = {
@@ -365,6 +402,7 @@ export class AgentLoop {
         args,
         this.config,
         this.approvalPolicy,
+        this.additionalWritableRoots,
         this.getCommandConfirmation,
         this.execAbortController?.signal,
       );
@@ -400,16 +438,16 @@ export class AgentLoop {
       // identified and dropped.
       const thisGeneration = ++this.generation;
 
-      // Reset cancellation flag for a fresh run.
+      // Reset cancellation flag and stream for a fresh run.
       this.canceled = false;
+      this.currentStream = null;
+
       // Create a fresh AbortController for this run so that tool calls from a
       // previous run do not accidentally get signalled.
       this.execAbortController = new AbortController();
-      if (isLoggingEnabled()) {
-        log(
-          `AgentLoop.run(): new execAbortController created (${this.execAbortController.signal}) for generation ${this.generation}`,
-        );
-      }
+      log(
+        `AgentLoop.run(): new execAbortController created (${this.execAbortController.signal}) for generation ${this.generation}`,
+      );
       // NOTE: We no longer (re‑)attach an `abort` listener to `hardAbort` here.
       // A single listener that forwards the `abort` to the current
       // `execAbortController` is installed once in the constructor. Re‑adding a
@@ -493,18 +531,16 @@ export class AgentLoop {
             let reasoning: Reasoning | undefined;
             if (this.model.startsWith("o")) {
               reasoning = { effort: "high" };
-              if (this.model === "o3" || this.model === "o4-mini") {
+              if ((this.model === "o3" || this.model === "o4-mini") && !AZURE_OPENAI_ENDPOINT) {
                 reasoning.summary = "auto";
               }
             }
             const mergedInstructions = [prefix, this.instructions]
               .filter(Boolean)
               .join("\n");
-            if (isLoggingEnabled()) {
-              log(
-                `instructions (length ${mergedInstructions.length}): ${mergedInstructions}`,
-              );
-            }
+            log(
+              `instructions (length ${mergedInstructions.length}): ${mergedInstructions}`,
+            );
             // eslint-disable-next-line no-await-in-loop
             stream = await this.oai.responses.create({
               model: this.model,
@@ -514,6 +550,7 @@ export class AgentLoop {
               stream: true,
               parallel_tool_calls: false,
               reasoning,
+              ...(this.config.flexMode ? { service_tier: "flex" } : {}),
               tools: [
                 {
                   type: "function",
@@ -604,7 +641,7 @@ export class AgentLoop {
 
                 // Parse suggested retry time from error message, e.g., "Please try again in 1.3s"
                 const msg = errCtx?.message ?? "";
-                const m = /retry again in ([\d.]+)s/i.exec(msg);
+                const m = /(?:retry|try) again in ([\d.]+)s/i.exec(msg);
                 if (m && m[1]) {
                   const suggested = parseFloat(m[1]) * 1000;
                   if (!Number.isNaN(suggested)) {
@@ -730,9 +767,7 @@ export class AgentLoop {
         try {
           // eslint-disable-next-line no-await-in-loop
           for await (const event of stream) {
-            if (isLoggingEnabled()) {
-              log(`AgentLoop.run(): response event ${event.type}`);
-            }
+            log(`AgentLoop.run(): response event ${event.type}`);
 
             // process and surface each item (no‑op until we can depend on streaming events)
             if (event.type === "response.output_item.done") {
@@ -785,6 +820,41 @@ export class AgentLoop {
               // It was aborted for some other reason; surface the error.
               throw err;
             }
+            this.onLoading(false);
+            return;
+          }
+          // Suppress internal stack on JSON parse failures
+          if (err instanceof SyntaxError) {
+            this.onItem({
+              id: `error-${Date.now()}`,
+              type: "message",
+              role: "system",
+              content: [
+                {
+                  type: "input_text",
+                  text: "⚠️ Failed to parse streaming response (invalid JSON). Please `/clear` to reset.",
+                },
+              ],
+            });
+            this.onLoading(false);
+            return;
+          }
+          // Handle OpenAI API quota errors
+          if (
+            err instanceof Error &&
+            (err as { code?: string }).code === "insufficient_quota"
+          ) {
+            this.onItem({
+              id: `error-${Date.now()}`,
+              type: "message",
+              role: "system",
+              content: [
+                {
+                  type: "input_text",
+                  text: "⚠️ Insufficient quota. Please check your billing details and retry.",
+                },
+              ],
+            });
             this.onLoading(false);
             return;
           }
@@ -907,6 +977,7 @@ export class AgentLoop {
       //     (e.g. ECONNRESET, ETIMEDOUT …)
       //   • the OpenAI SDK attached an HTTP `status` >= 500 indicating a
       //     server‑side problem.
+      //   • the error is model specific and detected in stream.
       // If matched we emit a single system message to inform the user and
       // resolve gracefully so callers can choose to retry.
       // -------------------------------------------------------------------
@@ -989,6 +1060,74 @@ export class AgentLoop {
         return;
       }
 
+      const isInvalidRequestError = () => {
+        if (!err || typeof err !== "object") {
+          return false;
+        }
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const e: any = err;
+
+        if (
+          e.type === "invalid_request_error" &&
+          e.code === "model_not_found"
+        ) {
+          return true;
+        }
+
+        if (
+          e.cause &&
+          e.cause.type === "invalid_request_error" &&
+          e.cause.code === "model_not_found"
+        ) {
+          return true;
+        }
+
+        return false;
+      };
+
+      if (isInvalidRequestError()) {
+        try {
+          // Extract request ID and error details from the error object
+
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const e: any = err;
+
+          const reqId =
+            e.request_id ??
+            (e.cause && e.cause.request_id) ??
+            (e.cause && e.cause.requestId);
+
+          const errorDetails = [
+            `Status: ${e.status || (e.cause && e.cause.status) || "unknown"}`,
+            `Code: ${e.code || (e.cause && e.cause.code) || "unknown"}`,
+            `Type: ${e.type || (e.cause && e.cause.type) || "unknown"}`,
+            `Message: ${
+              e.message || (e.cause && e.cause.message) || "unknown"
+            }`,
+          ].join(", ");
+
+          const msgText = `⚠️  OpenAI rejected the request${
+            reqId ? ` (request ID: ${reqId})` : ""
+          }. Error details: ${errorDetails}. Please verify your settings and try again.`;
+
+          this.onItem({
+            id: `error-${Date.now()}`,
+            type: "message",
+            role: "system",
+            content: [
+              {
+                type: "input_text",
+                text: msgText,
+              },
+            ],
+          });
+        } catch {
+          /* best-effort */
+        }
+        this.onLoading(false);
+        return;
+      }
+
       // Re‑throw all other errors so upstream handlers can decide what to do.
       throw err;
     }
@@ -1059,7 +1198,7 @@ You MUST adhere to the following criteria when executing the task:
             - If pre-commit doesn't work after a few retries, politely inform the user that the pre-commit setup is broken.
         - Once you finish coding, you must
             - Check \`git status\` to sanity check your changes; revert any scratch files or changes.
-            - Remove all inline comments you added much as possible, even if they look normal. Check using \`git diff\`. Inline comments must be generally avoided, unless active maintainers of the repo, after long careful study of the code and the issue, will still misinterpret the code without the comments.
+            - Remove all inline comments you added as much as possible, even if they look normal. Check using \`git diff\`. Inline comments must be generally avoided, unless active maintainers of the repo, after long careful study of the code and the issue, will still misinterpret the code without the comments.
             - Check if you accidentally add copyright or license headers. If so, remove them.
             - Try to run pre-commit if it is available.
             - For smaller tasks, describe in brief bullet points

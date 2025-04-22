@@ -1,14 +1,9 @@
 import {
   OPENAI_API_KEY,
   AZURE_OPENAI_ENDPOINT,
-  AZURE_OPENAI_API_VERSION,
   AZURE_OPENAI_DEPLOYMENT,
 } from "./config";
-import {
-  DefaultAzureCredential,
-  getBearerTokenProvider,
-} from "@azure/identity";
-import OpenAI, { AzureOpenAI } from "openai";
+import OpenAI from "openai";
 
 const MODEL_LIST_TIMEOUT_MS = 2_000; // 2 seconds
 export const RECOMMENDED_MODELS: Array<string> = ["o4-mini", "o3"];
@@ -26,31 +21,15 @@ let modelsPromise: Promise<Array<string>> | null = null;
 async function fetchModels(): Promise<Array<string>> {
   if (AZURE_OPENAI_ENDPOINT) {
     try {
-      // Use Azure AD token provider for Azure OpenAI
-      const credential = new DefaultAzureCredential();
-      const scope = "https://cognitiveservices.azure.com/.default";
-      const azureADTokenProvider = getBearerTokenProvider(credential, scope);
-
-      const azureClient = new AzureOpenAI({
-        azureADTokenProvider,
-        apiVersion: AZURE_OPENAI_API_VERSION!,
-      });
-
-      const models: Array<string> = [];
-
-      // If a deployment is specified, add it to the list
+      // For Azure OpenAI, we only return the configured deployment (if any) plus recommended models
+      // This is because the models.list() API doesn't reflect actual available deployments
+      const models = new Set<string>(RECOMMENDED_MODELS);
+      
       if (AZURE_OPENAI_DEPLOYMENT) {
-        models.push(AZURE_OPENAI_DEPLOYMENT);
+        models.add(AZURE_OPENAI_DEPLOYMENT);
       }
 
-      const list = await azureClient.models.list();
-      for await (const model of list as AsyncIterable<{ id?: string }>) {
-        if (model && typeof model.id === "string") {
-          models.push(model.id);
-        }
-      }
-
-      return models.sort();
+      return Array.from(models).sort();
     } catch {
       return RECOMMENDED_MODELS;
     }
@@ -74,7 +53,8 @@ async function fetchModels(): Promise<Array<string>> {
 
     return models.sort();
   } catch {
-    return [];
+    // Return recommended models on error to match Azure behavior
+    return RECOMMENDED_MODELS;
   }
 }
 

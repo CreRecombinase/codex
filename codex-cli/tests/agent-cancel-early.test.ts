@@ -54,11 +54,14 @@ vi.mock("openai", () => {
     };
   }
 
+  class FakeAzureOpenAI extends FakeOpenAI {}
+
   class APIConnectionTimeoutError extends Error {}
 
   return {
     __esModule: true,
     default: FakeOpenAI,
+    AzureOpenAI: FakeAzureOpenAI,
     APIConnectionTimeoutError,
     _test: { getBodies: () => bodies },
   };
@@ -81,6 +84,13 @@ vi.mock("../src/utils/agent/log.js", () => ({
   isLoggingEnabled: () => false,
 }));
 
+// Mock Azure Identity package
+vi.mock("@azure/identity", () => ({
+  __esModule: true,
+  DefaultAzureCredential: class {},
+  getBearerTokenProvider: () => ({}),
+}));
+
 import { AgentLoop } from "../src/utils/agent/agent-loop.js";
 
 describe("cancel before first function_call", () => {
@@ -88,6 +98,7 @@ describe("cancel before first function_call", () => {
     const { _test } = (await import("openai")) as any;
 
     const agent = new AgentLoop({
+      additionalWritableRoots: [],
       model: "any",
       instructions: "",
       approvalPolicy: { mode: "auto" } as any,
@@ -95,7 +106,7 @@ describe("cancel before first function_call", () => {
       onLoading: () => {},
       getCommandConfirmation: async () => ({ review: "yes" } as any),
       onLastResponseId: () => {},
-      config: { model: "any", instructions: "" },
+      config: { model: "any", instructions: "", notify: false },
     });
 
     // Start first run.

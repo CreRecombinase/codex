@@ -39,14 +39,24 @@ vi.mock("openai", () => {
     };
   }
 
+  class FakeAzureOpenAI extends FakeOpenAI {}
+
   class APIConnectionTimeoutError extends Error {}
 
   return {
     __esModule: true,
     default: FakeOpenAI,
+    AzureOpenAI: FakeAzureOpenAI,
     APIConnectionTimeoutError,
   };
 });
+
+// Mock Azure Identity package
+vi.mock("@azure/identity", () => ({
+  __esModule: true,
+  DefaultAzureCredential: class {},
+  getBearerTokenProvider: () => ({}),
+}));
 
 // The AgentLoop pulls these helpers in order to decide whether a command can
 // be auto‑approved. None of that matters for this test, so we stub the module
@@ -112,6 +122,7 @@ describe("AgentLoop", () => {
     expect(config.instructions).toContain("Hello docs!");
 
     const agent = new AgentLoop({
+      additionalWritableRoots: [],
       model: "o3", // arbitrary
       instructions: config.instructions,
       config,
